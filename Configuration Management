@@ -1,0 +1,347 @@
+"""
+Bond Basket Construction - Configuration Management
+
+This module handles basket type definitions, configuration schemas,
+parameter validation, and configuration templates.
+"""
+
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Set, Union, Any, Callable
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from abc import ABC, abstractmethod
+import yaml
+import json
+from pathlib import Path
+import warnings
+
+
+class BasketType(Enum):
+    """Enumeration of supported basket types."""
+    SECTOR = "sector"
+    SECTOR_RATING = "sector_rating" 
+    SECTOR_RATING_DURATION = "sector_rating_duration"
+    SIMILARITY = "similarity"
+    CUSTOM = "custom"
+
+
+@dataclass
+class WeightingConfig:
+    """Configuration for weighting methods."""
+    method: str  # 'equal', 'amount_outstanding', 'liquidity', 'custom'
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Validate weighting configuration."""
+        valid_methods = {'equal', 'amount_outstanding', 'liquidity', 'custom'}
+        if self.method not in valid_methods:
+            raise ValueError(f"Invalid weighting method: {self.method}. Must be one of {valid_methods}")
+
+
+@dataclass
+class ConstraintConfig:
+    """Configuration for basket constraints."""
+    min_basket_size: int = 5
+    max_basket_size: int = 50
+    max_single_weight: float = 0.20
+    max_sector_weight: float = 0.40
+    max_rating_weight: float = 0.60
+    min_liquidity_score: Optional[float] = None
+    allowed_sectors: Optional[Set[str]] = None
+    allowed_ratings: Optional[Set[str]] = None
+    duration_range: Optional[Tuple[float, float]] = None
+    
+    def __post_init__(self):
+        """Validate constraint configuration."""
+        if self.min_basket_size > self.max_basket_size:
+            raise ValueError("min_basket_size cannot be greater than max_basket_size")
+        
+        if not 0 < self.max_single_weight <= 1:
+            raise ValueError("max_single_weight must be between 0 and 1")
+            
+        if not 0 < self.max_sector_weight <= 1:
+            raise ValueError("max_sector_weight must be between 0 and 1")
+            
+        if not 0 < self.max_rating_weight <= 1:
+            raise ValueError("max_rating_weight must be between 0 and 1")
+        
+        if self.duration_range is not None:
+            if len(self.duration_range) != 2 or self.duration_range[0] >= self.duration_range[1]:
+                raise ValueError("duration_range must be (min_duration, max_duration) with min < max")
+
+
+@dataclass  
+class SimilarityConfig:
+    """Configuration for similarity-based basket construction."""
+    duration_tolerance: float = 0.5
+    require_exact_rating: bool = True
+    require_exact_sector: bool = True
+    require_higher_liquidity: bool = True
+    similarity_weights: Dict[str, float] = field(default_factory=lambda: {
+        'duration': 0.4,
+        'liquidity': 0.3, 
+        'rating': 0.2,
+        'sector': 0.1
+    })
+    
+    def __post_init__(self):
+        """Validate similarity configuration."""
+        if self.duration_tolerance <= 0:
+            raise ValueError("duration_tolerance must be positive")
+            
+        if abs(sum(self.similarity_weights.values()) - 1.0) > 1e-6:
+            raise ValueError("similarity_weights must sum to 1.0")
+
+
+@dataclass
+class BasketConfig:
+    """Complete basket configuration."""
+    basket_type: BasketType
+    weighting_config: WeightingConfig
+    constraint_config: ConstraintConfig = field(default_factory=ConstraintConfig)
+    similarity_config: Optional[SimilarityConfig] = None
+    filters: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Validate and enrich basket configuration."""
+        # Add similarity config for similarity baskets
+        if self.basket_type == BasketType.SIMILARITY and self.similarity_config is None:
+            self.similarity_config = SimilarityConfig()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary."""
+        result = asdict(self)
+        result['basket_type'] = self.basket_type.value
+        return result
+    
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'BasketConfig':
+        """Create configuration from dictionary."""
+        config_dict = config_dict.copy()
+        
+        # Convert basket_type string to enum
+        if isinstance(config_dict['basket_type'], str):
+            config_dict['basket_type'] = BasketType(config_dict['basket_type'])
+        
+        # Create WeightingConfig
+        if 'weighting_config' in config_dict:
+            weighting_data = config_dict['weighting_config']
+            config_dict['weighting_config'] = WeightingConfig(**weighting_data)
+        
+        # Create ConstraintConfig  
+        if 'constraint_config' in config_dict:
+            constraint_data = config_dict['constraint_config']
+            config_dict['constraint_config'] = ConstraintConfig(**constraint_data)
+        
+        # Create SimilarityConfig
+        if 'similarity_config' in config_dict and config_dict['similarity_config'] is not None:
+            similarity_data = config_dict['similarity_config']
+            config_dict['similarity_config'] = SimilarityConfig(**similarity_data)
+        
+        return cls(**config_dict)
+
+
+class ConfigValidator:
+    """Validates basket configurations against business rules."""
+    
+    def __init__(self):
+        self.validation_rules: List[Callable[[BasketConfig], List[str]]] = [
+            self._validate_basket_type_consistency,
+            self._validate_weighting_constraints,
+            self._validate_filter_compatibility,
+            self._validate_similarity_requirements
+        ]
+    
+    def validate_config(self, config: BasketConfig) -> List[str]:
+        """Run all validation rules against configuration."""
+        all_errors = []
+        
+        for rule in self.validation_rules:
+            errors = rule(config)
+            all_errors.extend(errors)
+        
+        return all_errors
+    
+    def _validate_basket_type_consistency(self, config: BasketConfig) -> List[str]:
+        """Validate basket type matches required filters."""
+        errors = []
+        
+        if config.basket_type == BasketType.SECTOR:
+            if 'sector' not in config.filters:
+                errors.append("Sector basket type requires 'sector' filter")
+        
+        elif config.basket_type == BasketType.SECTOR_RATING:
+            required_filters = {'sector', 'rating'}
+            missing = required_filters - set(config.filters.keys())
+            if missing:
+                errors.append(f"Sector+Rating basket type requires filters: {missing}")
+        
+        elif config.basket_type == BasketType.SECTOR_RATING_DURATION:
+            required_filters = {'sector', 'rating', 'duration_bucket'}
+            missing = required_filters - set(config.filters.keys())
+            if missing:
+                errors.append(f"Sector+Rating+Duration basket type requires filters: {missing}")
+        
+        elif config.basket_type == BasketType.SIMILARITY:
+            if 'reference_isin' not in config.filters:
+                errors.append("Similarity basket type requires 'reference_isin' filter")
+            if config.similarity_config is None:
+                errors.append("Similarity basket type requires similarity_config")
+        
+        return errors
+    
+    def _validate_weighting_constraints(self, config: BasketConfig) -> List[str]:
+        """Validate weighting method compatibility with constraints."""
+        errors = []
+        
+        weighting_method = config.weighting_config.method
+        
+        # Check if amount outstanding weighting is compatible with max single weight
+        if weighting_method == 'amount_outstanding':
+            if config.constraint_config.max_single_weight < 0.05:
+                errors.append(
+                    "Amount outstanding weighting may conflict with very low max_single_weight"
+                )
+        
+        # Check liquidity weighting requirements
+        if weighting_method == 'liquidity':
+            if config.constraint_config.min_liquidity_score is None:
+                warnings.warn(
+                    "Liquidity weighting without min_liquidity_score may produce unstable results"
+                )
+        
+        return errors
+    
+    def _validate_filter_compatibility(self, config: BasketConfig) -> List[str]:
+        """Validate filter combinations make sense."""
+        errors = []
+        
+        # Check duration range vs duration bucket compatibility
+        if 'duration_bucket' in config.filters and config.constraint_config.duration_range is not None:
+            errors.append(
+                "Cannot specify both duration_bucket filter and duration_range constraint"
+            )
+        
+        return errors
+    
+    def _validate_similarity_requirements(self, config: BasketConfig) -> List[str]:
+        """Validate similarity configuration requirements."""
+        errors = []
+        
+        if config.basket_type == BasketType.SIMILARITY:
+            if config.similarity_config is None:
+                errors.append("Similarity basket requires similarity_config")
+            else:
+                # Validate similarity weights
+                required_features = {'duration', 'liquidity', 'rating', 'sector'}
+                provided_features = set(config.similarity_config.similarity_weights.keys())
+                
+                if not required_features.issubset(provided_features):
+                    missing = required_features - provided_features
+                    errors.append(f"Similarity config missing weights for: {missing}")
+        
+        return errors
+
+
+class BasketTemplate:
+    """Template for predefined basket configurations."""
+    
+    def __init__(self, name: str, config: BasketConfig, description: str = ""):
+        self.name = name
+        self.config = config
+        self.description = description
+    
+    def create_config(self, **overrides) -> BasketConfig:
+        """Create configuration from template with overrides."""
+        # Deep copy template config
+        config_dict = self.config.to_dict()
+        
+        # Apply overrides
+        for key, value in overrides.items():
+            if '.' in key:
+                # Handle nested keys like 'constraint_config.max_basket_size'
+                parts = key.split('.')
+                target = config_dict
+                for part in parts[:-1]:
+                    target = target[part]
+                target[parts[-1]] = value
+            else:
+                config_dict[key] = value
+        
+        return BasketConfig.from_dict(config_dict)
+
+
+class BasketTypeRegistry:
+    """Central registry for basket types and templates."""
+    
+    def __init__(self):
+        self.templates: Dict[str, BasketTemplate] = {}
+        self.validator = ConfigValidator()
+        self._initialize_default_templates()
+    
+    def register_template(self, template: BasketTemplate) -> None:
+        """Register a basket template."""
+        # Validate template configuration
+        errors = self.validator.validate_config(template.config)
+        if errors:
+            raise ValueError(f"Invalid template configuration: {errors}")
+        
+        self.templates[template.name] = template
+    
+    def get_template(self, name: str) -> BasketTemplate:
+        """Retrieve basket template by name."""
+        if name not in self.templates:
+            available = list(self.templates.keys())
+            raise ValueError(f"Template '{name}' not found. Available templates: {available}")
+        
+        return self.templates[name]
+    
+    def list_templates(self) -> List[Dict[str, str]]:
+        """List all available templates."""
+        return [
+            {
+                'name': template.name,
+                'type': template.config.basket_type.value,
+                'weighting': template.config.weighting_config.method,
+                'description': template.description
+            }
+            for template in self.templates.values()
+        ]
+    
+    def create_config(self, template_name: str, **overrides) -> BasketConfig:
+        """Create configuration from template with overrides."""
+        template = self.get_template(template_name)
+        config = template.create_config(**overrides)
+        
+        # Validate final configuration
+        errors = self.validator.validate_config(config)
+        if errors:
+            raise ValueError(f"Configuration validation errors: {errors}")
+        
+        return config
+    
+    def validate_config(self, config: BasketConfig) -> List[str]:
+        """Validate a basket configuration."""
+        return self.validator.validate_config(config)
+    
+    def save_template(self, template_name: str, filepath: Union[str, Path]) -> None:
+        """Save template configuration to file."""
+        template = self.get_template(template_name)
+        config_dict = template.config.to_dict()
+        
+        filepath = Path(filepath)
+        if filepath.suffix.lower() == '.yaml':
+            with open(filepath, 'w') as f:
+                yaml.safe_dump(config_dict, f, default_flow_style=False)
+        else:
+            with open(filepath, 'w') as f:
+                json.dump(config_dict, f, indent=2)
+    
+    def load_template_from_file(self, filepath: Union[str, Path], 
+                               template_name: Optional[str] = None) -> str:
+        """Load template configuration from file."""
+        filepath = Path(filepath)
+        
+        if filepath.suffix.lower() == '.yaml
