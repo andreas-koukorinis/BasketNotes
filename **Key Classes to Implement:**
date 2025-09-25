@@ -1,0 +1,291 @@
+
+
+1. **TradingSchemaValidator**:
+   - Validate incoming DataFrames against TradingSchema requirements
+   - Check required columns, data types, value ranges
+   - Generate DataQualityReport with detailed validation results
+   - Handle missing data strategies (drop, fill, warn)
+
+2. **UniverseFilter** (TradingSchema-based):
+   - filter_by_schema(df, schema) -> apply base trading rules
+   - filter_by_liquidity_percentile(df, min_percentile) 
+   - filter_by_sector(df, allowed_sectors)
+   - filter_by_rating_range(df, min_rating, max_rating)
+   - filter_for_similarity(df, reference_isin, criteria) -> similarity constraints
+   - Each method should preserve schema compliance
+
+3. **BondDataProcessor** (main orchestrator):
+   - process_universe(raw_df, trading_schema) -> (clean_df, quality_report)
+   - standardize_to_schema(df, schema) -> apply column mappings and types
+   - validate_universe_quality(df) -> comprehensive data quality checks
+   - enrich_with_derived_features(df) -> add computed columns (rating_category, size_bucket, etc.)
+
+4. **DataQualityReport dataclass**:
+   - Schema compliance metrics
+   - Missing data summary by column
+   - Outlier detection results  
+   - Data type conversion issues
+   - Actionable recommendations for data quality improvement
+
+**Integration Points:**
+- Use BasketInput.universe as the primary data container
+- Leverage TradingSchema for all column name standardization
+- Return processed data in schema-compliant format
+- Generate warnings that integrate with BasketOutput.warnings
+
+**Performance Requirements:**
+- Optimize pandas operations for large datasets (100k+ bonds)
+- Use vectorized operations for all filtering
+- Memory-efficient data processing patterns
+- Lazy evaluation where possible
+
+The module should serve as the data gateway that ensures all downstream basket construction works with clean, schema-compliant data.
+Prompt 3: Core Basket Construction Logic (basket_construction.py)
+Implement basket_construction.py as the core business logic layer that uses data structures from basket_types.py and processes data from data_prep_basket.py.
+
+**Architecture Requirements:**
+- Import and use BasketInput, BasketOutput, and other data classes from basket_types
+- Implement Strategy pattern for different weighting methods
+- Use composition with clear separation of concerns
+- All methods should accept/return structured data classes
+
+**Key Components to Implement:**
+
+1. **WeightingStrategy ABC and implementations**:
+   - EqualWeightStrategy: weights = 1/n for all positions
+   - AmountOutstandingWeightStrategy: weights ∝ amount_outstanding
+   - LiquidityWeightStrategy: weights ∝ liquidity_score with power parameter
+   - CustomWeightStrategy: user-defined weighting function
+   - Each strategy validates required columns and handles edge cases
+
+2. **BasketConstructor** (main orchestrator):
+   - build_basket(basket_input: BasketInput) -> BasketOutput
+   - Delegate to specialized builders based on basket_input.basket_type
+   - Apply weighting strategy from basket_input.weighting_method
+   - Validate constraints from basket_input.constraints
+   - Generate comprehensive BasketOutput with metadata
+
+3. **Specialized basket builders**:
+   - SectorBasketBuilder(universe, sector, size_limit)
+   - SectorRatingBasketBuilder(universe, sector, rating, size_limit)  
+   - SectorRatingDurationBasketBuilder(universe, sector, rating, duration_bucket, size_limit)
+   - SimilarityBasketBuilder(universe, reference_isin, similarity_params)
+
+4. **SimilarityMatcher**:
+   - find_similar_bonds(universe, reference_isin, criteria) -> filtered DataFrame
+   - calculate_similarity_scores() using duration, rating, sector, liquidity
+   - apply_similarity_constraints() with tolerance parameters
+   - rank_by_similarity() for final selection
+
+5. **ConstraintValidator**:
+   - validate_basket_constraints(constituents, weights, constraints) -> violations list
+   - Check size limits, concentration limits, diversification requirements
+   - Generate actionable constraint violation messages
+   - Suggest remediation strategies
+
+6. **QualityMetricsCalculator**:
+   - calculate_portfolio_metrics(constituents, weights) -> comprehensive metrics dict
+   - Duration, sector, rating diversification measures
+   - Concentration metrics (Herfindahl index, effective N positions)
+   - Liquidity and size distribution statistics
+
+**Method Signatures:**
+```python
+def build_basket(basket_input: BasketInput) -> BasketOutput:
+def calculate_weights(bonds: pd.DataFrame, method: WeightingMethod, **params) -> pd.Series:
+def find_similar_bonds(universe: pd.DataFrame, reference_isin: str, config: SimilarityConfig) -> pd.DataFrame:
+def validate_constraints(basket_output: BasketOutput) -> List[ConstraintViolation]:
+Error Handling:
+
+Structured error classes that integrate with BasketOutput.warnings
+Graceful degradation for edge cases (insufficient bonds, data quality issues)
+Clear error messages with suggested remediation steps
+
+The module should be the computational engine that transforms BasketInput into BasketOutput through clean, composable algorithms.
+
+## Prompt 4: Integration Layer & Usage Patterns
+Create an integration layer that demonstrates how the three modules (basket_types, data_prep_basket, basket_construction) work together, plus usage examples for common basket construction scenarios.
+Files to Create:
+
+basket_factory.py - High-level factory interface:
+
+pythonclass BasketFactory:
+    def __init__(self, trading_schema: TradingSchema, config: Dict = None)
+    def create_sector_basket(self, universe: pd.DataFrame, sector: str, **kwargs) -> BasketOutput
+    def create_similarity_basket(self, universe: pd.DataFrame, reference_isin: str, **kwargs) -> BasketOutput  
+    def create_custom_basket(self, basket_input: BasketInput) -> BasketOutput
+    def batch_create_baskets(self, universe: pd.DataFrame, basket_configs: List[Dict]) -> List[BasketOutput]
+
+examples/usage_examples.py - Comprehensive usage examples:
+
+Example 1: Single Sector Basket
+python# Load and prepare data
+raw_universe = pd.read_csv('bond_universe.csv')
+processor = create_data_processor()
+clean_universe, quality_report = processor.process_universe(raw_universe)
+
+# Create sector basket
+basket_factory = BasketFactory(TradingSchema())
+financials_basket = basket_factory.create_sector_basket(
+    universe=clean_universe,
+    sector='Financials', 
+    basket_size=25,
+    weighting_method=WeightingMethod.LIQUIDITY,
+    max_single_weight=0.15
+)
+
+# Access results
+print(f"Created basket with {len(financials_basket.constituents)} bonds")
+print(f"Portfolio duration: {financials_basket.metadata['portfolio_duration']:.2f}")
+Example 2: Similarity-Based Basket
+python# Create basket similar to reference bond
+reference_isin = 'US912828XW45'
+similar_basket = basket_factory.create_similarity_basket(
+    universe=clean_universe,
+    reference_isin=reference_isin,
+    basket_size=20,
+    duration_tolerance=0.3,
+    require_higher_liquidity=True
+)
+Example 3: Batch Processing Multiple Baskets
+python# Define multiple basket configurations
+basket_configs = [
+    {'type': 'sector', 'sector': 'Technology', 'size': 30},
+    {'type': 'sector_rating', 'sector': 'Healthcare', 'rating': 'A', 'size': 25},
+    {'type': 'similarity', 'reference_isin': 'US912828XW45', 'size': 20}
+]
+
+# Create all baskets
+baskets = basket_factory.batch_create_baskets(clean_universe, basket_configs)
+
+# Analyze results
+for basket in baskets:
+    print(f"{basket.basket_id}: {basket.quality_metrics['effective_positions']:.1f} effective positions")
+
+tests/test_integration.py - Integration tests:
+
+Test end-to-end basket creation workflows
+Validate data flow between modules
+Test error handling and edge cases
+Performance benchmarks for large universes
+
+
+config/default_configs.py - Pre-defined configurations:
+
+Standard basket templates (conservative, aggressive, balanced)
+Sector-specific configurations
+Rating-based configurations
+Similarity matching profiles
+
+
+
+Documentation Requirements:
+
+Add comprehensive docstrings with examples
+Create README.md with quick start guide
+Document configuration options and their impacts
+Include performance considerations and best practices
+
+Validation Requirements:
+
+Ensure all components integrate seamlessly
+Validate that BasketInput -> BasketOutput flow works correctly
+Test with various data quality scenarios
+Verify constraint validation works across all basket types
+
+The integration layer should make the system easy to use while maintaining the flexibility and power of the underlying components.
+
+## Prompt 5: Advanced Features & Error Handling
+Implement advanced features and comprehensive error handling for the bond basket construction system.
+Advanced Features to Implement:
+
+BasketOptimizer in basket_construction.py:
+
+Optimize basket weights subject to constraints using scipy.optimize
+Objective functions: minimize tracking error, maximize diversification, minimize concentration
+Support for custom optimization objectives
+Handle infeasible constraint sets gracefully
+
+
+BasketAnalyzer for post-construction analysis:
+
+Performance attribution analysis
+Risk decomposition (duration risk, credit risk, sector risk)
+Comparison tools for multiple baskets
+Sensitivity analysis for parameter changes
+
+
+ConfigurationManager in basket_types.py:
+
+Save/load basket configurations to/from YAML/JSON
+Template management with inheritance
+Configuration validation with business rules
+Version control for configuration schemas
+
+
+Comprehensive Error Handling:
+
+Create custom exception hierarchy:
+pythonclass BasketConstructionError(Exception): pass
+class InsufficientDataError(BasketConstructionError): pass  
+class ConstraintViolationError(BasketConstructionError): pass
+class ConfigurationError(BasketConstructionError): pass
+Error Handling Patterns:
+
+Structured error messages with context and suggestions
+Graceful degradation where possible (e.g., fallback weighting methods)
+Comprehensive logging with different levels (DEBUG, INFO, WARNING, ERROR)
+Error recovery strategies for common issues
+
+
+Performance Optimizations:
+
+Caching for repeated similar basket constructions
+Parallel processing for batch basket creation
+Memory-efficient processing for large universes
+Performance profiling and benchmarking tools
+
+
+Data Quality Enhancements:
+
+Automated data quality scoring
+Data drift detection for universe changes
+Outlier detection and handling strategies
+Missing data imputation methods specific to bond data
+
+
+
+Implementation Requirements:
+
+All advanced features should integrate with existing data classes
+Maintain backward compatibility with basic usage patterns
+Add comprehensive unit tests for new functionality
+Include performance benchmarks and optimization guidelines
+Document all new features with examples
+
+Monitoring and Observability:
+
+Basket construction metrics and timing
+Data quality trend monitoring
+Configuration change tracking
+Performance regression detection
+
+The advanced features should make the system production-ready while maintaining the clean architecture and ease of use.
+
+These prompts provide a structured approach to implementing your bond basket construction system using Cursor, with clear separation of concerns and integration points between the modules. Each prompt focuses on a specific layer of the architecture and provides concrete implementation guidance.Refactoring approach using basket_types for TradingSchemaThe user asked for detailed prompts for Cursor to refactor the approach based on their clarifications. I've structured this as 5 comprehensive prompts that:
+
+Focus on their existing architecture where basket_types.py is the core schema/data structure layer
+Remove the liquidity calculator since they have pre-computed liquidity
+Implement TradingSchema-based UniverseFilter in data_prep_basket
+Use structured data classes throughout
+Provide integration examples and advanced features
+
+Each prompt is detailed enough for an engineer to use with Cursor to implement that specific component. The prompts:
+
+Are specific and actionable
+Include code structure and method signatures where helpful
+Specify integration points between modules
+Include technical requirements and constraints
+Provide clear context about what each module should do
+
+The structure respects their existing architecture while providing a comprehensive technical design that an experienced quant developer can implement.Retry
