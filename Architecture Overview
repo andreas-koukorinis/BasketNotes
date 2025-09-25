@@ -1,0 +1,1137 @@
+
+Three modules, clear responsibilities:
+
+data_prep_basket.py
+Ingests internal DataFrames, normalizes canonical columns (e.g., sector, rating, duration_years, liq_score, amt_out), creates derived features (duration buckets), validates required fields, and returns a PreparedUniverse (a typed wrapper around a cleaned DataFrame with metadata).
+No basket logic here.
+
+basket_construction.py
+Core algorithms to select constituents and compute long-only weights. Encapsulates:
+
+Selection pipelines (by sector/rating/duration, or similarity to a reference ISIN with constraints).
+
+Weighting strategies (Equal / Outstanding / Liquidity) via a Strategy pattern.
+
+Deterministic policies (tie-breaking, min/max basket sizes).
+Returns BasketResult objects containing a composition DataFrame and metadata.
+
+basket_types.py
+Basket configuration model, enumerations for BasketType and WeightScheme, parameter validation, default policies, and “relaxation” rules for when strict constraints yield too few bonds.
+
+Data Flow
+
+Raw DataFrames (internal sources)
+        |
+        v
+ data_prep_basket.prepare()
+        |
+   PreparedUniverse
+        |
+        v
+basket_construction.BasketConstructor.build_*()
+   (uses WeightingStrategy + selection policies)
+        |
+        v
+     BasketResult(s)
+   └─ DataFrame: [isin, weight, sector, rating, duration_years, ...]
+
+2) File Structure Design
+data_prep_basket.py
+
+Responsibilities
+
+Column standardization (aliases → canonical names).
+
+Type coercion, rating normalization (e.g., “A-”, “A3” → internal scale).
+
+Duration bucket derivation (if not already provided).
+
+Liquidity normalization (monotone increasing scale; higher means more liquid).
+
+Validation (required columns present; non-negative amounts; finite durations).
+
+Return PreparedUniverse with the cleaned, indexed DataFrame and metadata (e.g., snapshot timestamp, mappings used).
+
+Key Classes & Methods (signatures)
+
+# data_prep_basket.py
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Tuple
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+REQUIRED_COLS = [
+    "isin", "sector", "rating", "duration_years",
+    "amt_out", "liq_score"  # canonical names
+]
+
+RATING_MAP = {
+    # map common agency-specific notations to an ordinal scale (lower = worse)
+    # Example scale: AAA=21, AA+=20, ..., BBB-=12, BB+=11, ..., CCC=3, CC=2, C=1
+    # Fill with your house mapping; keep injective within letter +/- granularity.
+}
+
+@dataclass(frozen=True)
+class PreparedUniverse:
+    df: pd.DataFrame                       # canonicalized, validated
+    snapshot_ts: datetime                  # reference time for the snapshot
+    rating_to_score: Dict[str, int]        # mapping used
+    duration_bucket_edges: Tuple[float, ...]  # e.g., (0, 1, 3, 5, 7, 10, 30)
+
+class DataPrepBasket:
+    def __init__(
+        self,
+        required_cols: Optional[List[str]] = None,
+        rating_map: Optional[Dict[str, int]] = None,
+        duration_bucket_edges: Tuple[float, ...] = (0, 1, 3, 5, 7, 10, 30),
+        canonical_aliases: Optional[Dict[str, str]] = None
+    ) -> None: ...
+
+    def prepare(self, df_raw: pd.DataFrame) -> PreparedUniverse:
+        """
+        - Apply column alias mapping to canonical names.
+        - Validate presence of REQUIRED_COLS.
+        - Normalize sector strings, strip spaces.
+        - Normalize ratings -> 'rating_score' (int), and keep 'rating' as label.
+        - Coerce numeric types; clip/NaN-handle duration, amt_out, liq_score.
+        - Create 'duration_bucket' categorical using edges.
+        - Create stable index by 'isin'; drop duplicates with defined policy.
+        Return a PreparedUniverse.
+        """
+
+    # (Optionally) expose utilities used internally:
+    def normalize_ratings(self, ser: pd.Series) -> pd.Series: ...
+    def make_duration_bucket(self, ser: pd.Series) -> pd.Series: ...
+
+
+Implementation Notes
+
+Columns: Accept friendly aliases (e.g., ISIN, liquidity, amount_outstanding, dur) via canonical_aliases.
+
+Ratings: Provide a strict, monotone mapping (agency-agnostic). Persist rating (string) and add rating_score (int).
+
+Liquidity: Expect a monotone higher-is-better score. If needed, z-score or min-max normalize but keep original as well.
+
+Duration: Float in years (duration_years), finite and non-negative.
+
+Buckets: pd.cut with closed=”right” and labeled bins (e.g., “0-1y”, “1-3y”, …).
+
+basket_construction.py
+
+Responsibilities
+
+Basket selection logic (filters, constraints, top-K policies).
+
+Similarity basket from a reference ISIN with constraints.
+
+Weight computation (Strategy pattern).
+
+Deterministic behavior (tie-break: liquidity desc, then isin asc).
+
+Return results with full traceability.
+
+Core Types & Strategies
+
+# basket_construction.py
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple, Protocol, Literal
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+from .data_prep_basket import PreparedUniverse
+from .basket_types import BasketType, WeightScheme, BasketConfig, SelectionPolicy
+from .errors import (
+    InvalidConfigurationError, InsufficientCandidatesError,
+    MissingReferenceError
+)
+
+# --- Weighting Strategy ---------------------------------
+
+class WeightingStrategy(Protocol):
+    def compute(self, df_sel: pd.DataFrame) -> pd.Series:
+        """Return pd.Series of weights indexed by 'isin', non-negative, sum=1."""
+
+class EqualWeight(WeightingStrategy):
+    def compute(self, df_sel: pd.DataFrame) -> pd.Series: ...
+
+class OutstandingWeight(WeightingStrategy):
+    def compute(self, df_sel: pd.DataFrame) -> pd.Series:
+        # weights ∝ amt_out
+
+class LiquidityWeight(WeightingStrategy):
+    def compute(self, df_sel: pd.DataFrame) -> pd.Series:
+        # weights ∝ liq_score
+
+WEIGHT_STRATEGY_MAP = {
+    WeightScheme.EQUAL: EqualWeight(),
+    WeightScheme.AMOUNT_OUTSTANDING: OutstandingWeight(),
+    WeightScheme.LIQUIDITY: LiquidityWeight(),
+}
+
+# --- Results --------------------------------------------
+
+@dataclass(frozen=True)
+class BasketMeta:
+    basket_type: BasketType
+    group_keys: Dict[str, str]      # e.g., {"sector": "IG Finance", "rating": "A", ...}
+    weight_scheme: WeightScheme
+    selection_policy: SelectionPolicy
+    build_ts: datetime
+    constraints: Dict[str, object]  # duration tol, liquidity floor, etc.
+    reference_isin: Optional[str] = None
+
+@dataclass(frozen=True)
+class BasketResult:
+    constituents: pd.DataFrame      # columns: isin, weight, sector, rating, duration_years, liq_score, ...
+    meta: BasketMeta
+
+# --- Constructor ----------------------------------------
+
+class BasketConstructor:
+    def __init__(self, universe: PreparedUniverse) -> None: ...
+
+    def build_group_baskets(
+        self,
+        config: BasketConfig
+    ) -> List[BasketResult]:
+        """
+        For BasketType.SECTOR / SECTOR_RATING / SECTOR_RATING_DURATION:
+        - Partition universe by group_keys in config.
+        - Within each group, rank/filter by constraints (liquidity floors, min amt_out, etc.).
+        - Select K (min_size..max_size) according to selection_policy.
+        - Compute weights with strategy.
+        - Return a BasketResult per non-empty group that meets min_size.
+        """
+
+    def build_similarity_basket(
+        self,
+        reference_isin: str,
+        config: BasketConfig
+    ) -> BasketResult:
+        """
+        Constraints (as required):
+          - same sector as reference
+          - exact rating match with reference
+          - duration within ±config.duration_tolerance_years (default 0.5)
+          - liquidity strictly higher than reference
+        Then select [min_size..max_size] with selection policy and compute weights.
+        """
+
+    # Internal helpers (stable, unit-testable)
+    def _select_candidates_for_group(self, df: pd.DataFrame, config: BasketConfig) -> pd.DataFrame: ...
+    def _apply_selection_policy(self, df: pd.DataFrame, config: BasketConfig) -> pd.DataFrame: ...
+    def _compute_weights(self, df_sel: pd.DataFrame, scheme: WeightScheme) -> pd.Series: ...
+
+
+Selection Policy
+
+Default: SelectionPolicy.TOP_BY_LIQUIDITY (take top-K by liq_score desc).
+
+Deterministic tie-breakers: liq_score desc, amt_out desc, then isin asc.
+
+Relaxation Logic (optional, controlled by config)
+
+If fewer than min_size after strict filters:
+
+Widen duration tolerance (e.g., 0.5 → 0.75 → 1.0).
+
+If still insufficient for group baskets (not similarity), allow next-best rating neighbor bands (e.g., one notch).
+
+Document applied relaxations in meta.constraints.
+
+Performance Notes
+
+Avoid groupby.apply heavy lambdas; prefer pre-filter + block-selection with vectorized sorting and head/tail.
+
+Use boolean masks and a small number of sorts.
+
+Compute weights via vector ops; normalize with safe divide + np.clip to enforce non-negativity.
+
+basket_types.py
+
+Responsibilities
+
+Enumerations, configuration dataclasses, parameter validation.
+
+Sensible defaults for selection policy, size bounds, tolerances, and constraints.
+
+Key Types
+
+# basket_types.py
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Dict, Optional, Tuple, Literal
+
+class BasketType(Enum):
+    SECTOR = auto()
+    SECTOR_RATING = auto()
+    SECTOR_RATING_DURATION = auto()
+    SIMILARITY = auto()
+
+class WeightScheme(Enum):
+    EQUAL = auto()
+    AMOUNT_OUTSTANDING = auto()
+    LIQUIDITY = auto()
+
+class SelectionPolicy(Enum):
+    TOP_BY_LIQUIDITY = auto()
+    TOP_BY_AMOUNT_OUT = auto()
+    RANDOM_WITH_SEED = auto()  # deterministic with seed; rarely used in RV
+
+@dataclass
+class BasketConfig:
+    basket_type: BasketType
+    weight_scheme: WeightScheme = WeightScheme.EQUAL
+    selection_policy: SelectionPolicy = SelectionPolicy.TOP_BY_LIQUIDITY
+
+    # Basket size bounds
+    min_size: int = 5
+    max_size: int = 25  # can be set up to 50
+
+    # Grouping keys (used for non-similarity baskets)
+    group_by_sector: bool = True
+    group_by_rating: bool = False
+    group_by_duration_bucket: bool = False
+
+    # Filters / constraints (inclusive unless otherwise stated)
+    min_liq_score: Optional[float] = None
+    min_amt_out: Optional[float] = None
+
+    # Similarity constraints
+    duration_tolerance_years: float = 0.5
+    enforce_exact_rating: bool = True
+    enforce_same_sector: bool = True
+    strictly_higher_liquidity_than_ref: bool = True
+
+    # Relaxation policy (optional)
+    enable_relaxation: bool = True
+    relaxation_steps: Tuple[str, ...] = ("widen_duration", "neighbor_rating")
+
+    # Random selection seed (if needed)
+    random_seed: Optional[int] = None
+
+    def validate(self) -> None:
+        if self.min_size <= 0 or self.max_size <= 0 or self.max_size < self.min_size:
+            raise InvalidConfigurationError("Invalid basket size bounds.")
+        if self.basket_type == BasketType.SECTOR and not self.group_by_sector:
+            raise InvalidConfigurationError("SECTOR baskets must group_by_sector.")
+        if self.basket_type == BasketType.SECTOR_RATING and not (self.group_by_sector and self.group_by_rating):
+            raise InvalidConfigurationError("SECTOR_RATING requires sector+rating grouping.")
+        if self.basket_type == BasketType.SECTOR_RATING_DURATION and not (self.group_by_sector and self.group_by_rating and self.group_by_duration_bucket):
+            raise InvalidConfigurationError("SECTOR_RATING_DURATION requires sector+rating+duration_bucket.")
+        if self.basket_type == BasketType.SIMILARITY and any([self.group_by_sector, self.group_by_rating, self.group_by_duration_bucket]):
+            raise InvalidConfigurationError("SIMILARITY baskets do not use group_by flags.")
+
+
+Custom Errors (errors.py)
+
+class InvalidConfigurationError(ValueError): ...
+class InsufficientCandidatesError(RuntimeError): ...
+class MissingReferenceError(KeyError): ...
+
+3) Class Design (Encapsulation & Relationships)
+
+DataPrepBasket
+
+Encapsulates normalization logic and mappings (e.g., rating scale).
+
+Returns an immutable PreparedUniverse (data + metadata) to guarantee downstream consistency.
+
+BasketConstructor
+
+Holds one PreparedUniverse, guaranteeing all baskets in a run share a common snapshot & mappings.
+
+Delegates weights to WeightingStrategy implementations via a Strategy pattern (EqualWeight, OutstandingWeight, LiquidityWeight).
+
+Uses SelectionPolicy to determine how to pick the top K constituents in each group.
+
+BasketConfig
+
+Encapsulates all knobs (size bounds, constraints, relaxations).
+
+Self-validates; BasketConstructor calls config.validate() before building.
+
+Relationships:
+
+DataPrepBasket --creates--> PreparedUniverse
+BasketConstructor(universe) --uses--> BasketConfig
+BasketConstructor --selects--> candidates --> WeightingStrategy.compute()
+BasketConstructor --returns--> BasketResult
+
+4) API Design (Key Interfaces)
+# Entry points a quant dev will use:
+
+# 1) Prepare universe
+prep = DataPrepBasket(
+    canonical_aliases={"ISIN": "isin", "liquidity": "liq_score", "amount_outstanding": "amt_out", "dur": "duration_years"}
+)
+universe = prep.prepare(df_raw)
+
+# 2) Construct baskets by group
+from .basket_types import BasketConfig, BasketType, WeightScheme
+
+cfg = BasketConfig(
+    basket_type=BasketType.SECTOR_RATING_DURATION,
+    weight_scheme=WeightScheme.LIQUIDITY,
+    selection_policy=SelectionPolicy.TOP_BY_LIQUIDITY,
+    min_size=10, max_size=30,
+    min_liq_score=0.2, min_amt_out=5e8,
+    group_by_sector=True, group_by_rating=True, group_by_duration_bucket=True,
+)
+constructor = BasketConstructor(universe)
+results: List[BasketResult] = constructor.build_group_baskets(cfg)
+
+# 3) Construct similarity basket from a reference ISIN
+sim_cfg = BasketConfig(
+    basket_type=BasketType.SIMILARITY,
+    weight_scheme=WeightScheme.AMOUNT_OUTSTANDING,
+    duration_tolerance_years=0.5,
+    enforce_exact_rating=True,
+    enforce_same_sector=True,
+    strictly_higher_liquidity_than_ref=True,
+    min_size=8, max_size=20,
+)
+sim_result: BasketResult = constructor.build_similarity_basket(reference_isin="US1234567890", config=sim_cfg)
+
+5) Data Models (Schemas)
+
+Input DataFrame (any column names accepted if mapped to canonical via aliases):
+
+isin: str (unique key)
+
+sector: str (normalized label)
+
+rating: str (agency-agnostic labels: AAA, AA+, AA, ...)
+
+duration_years: float (>= 0, finite)
+
+amt_out: float (>= 0; face value outstanding)
+
+liq_score: float (monotone: higher = more liquid)
+
+Optional: currency, country, maturity_date, coupon, etc.
+
+Prepared Universe adds:
+
+rating_score: int
+
+duration_bucket: category
+
+Cleaned types and deduped isin index.
+
+BasketResult.constituents:
+
+Required columns: isin, weight.
+
+Pass-through columns: sector, rating, rating_score, duration_years, duration_bucket, amt_out, liq_score (for downstream auditability).
+
+Weights:
+
+All non-negative and sum to 1.0 (within numerical tolerance 1e-10).
+
+Clip and renormalize if any zeros arise due to all-zero signals.
+
+6) Configuration Schema
+
+BasketConfig (see above) defines:
+
+Type: SECTOR / SECTOR_RATING / SECTOR_RATING_DURATION / SIMILARITY.
+
+Weight scheme: EQUAL / AMOUNT_OUTSTANDING / LIQUIDITY.
+
+Selection policy: TOP_BY_LIQUIDITY | TOP_BY_AMOUNT_OUT | RANDOM_WITH_SEED.
+
+Size bounds: min_size–max_size (5–50).
+
+Filters: min_liq_score, min_amt_out.
+
+Similarity constraints: duration_tolerance_years, rating/sector enforcement, liquidity strictly higher than reference.
+
+Relaxation: enable/disable and steps order.
+
+Validation is executed in BasketConfig.validate(). BasketConstructor refuses to run on invalid configs.
+
+7) Error Handling Strategy
+
+InvalidConfigurationError
+Thrown when BasketConfig is inconsistent (e.g., min_size > max_size, SIMILARITY paired with grouping flags).
+
+MissingReferenceError
+Thrown by build_similarity_basket if reference_isin not in universe.
+
+InsufficientCandidatesError
+Thrown when, after applying constraints (and optional relaxations, if enabled), a group cannot meet min_size.
+Alternative policy: if config.enable_relaxation is True, automatically attempt:
+
+widen_duration: increase tolerance by steps (e.g., +0.25y, +0.25y … up to 1.0y).
+
+neighbor_rating: (for non-similarity group baskets) include adjacent notches (e.g., allow rating_score ±1) with explicit note in meta.constraints.
+
+Data Quality Guards
+
+Missing/NaN in key fields are filtered out during prep. Offenders are counted and reported (optional logging hook).
+
+Non-positive amt_out or liq_score can be filtered by min_amt_out/min_liq_score.
+
+Determinism
+
+All selections use stable sorting with explicit tie-breakers.
+
+RANDOM_WITH_SEED uses np.random.default_rng(seed) and sorts by generated key to keep reproducibility.
+
+8) Usage Examples
+A) Create Standard Baskets by Sector / Rating / Duration
+from basket_types import BasketConfig, BasketType, WeightScheme, SelectionPolicy
+from data_prep_basket import DataPrepBasket
+from basket_construction import BasketConstructor
+
+# 1) Prepare
+prep = DataPrepBasket(canonical_aliases={"ISIN":"isin","Liquidity":"liq_score","Outstanding":"amt_out","Duration":"duration_years"})
+universe = prep.prepare(df_bonds)
+
+# 2) Configure a Sector+Rating+Duration basket
+cfg = BasketConfig(
+    basket_type=BasketType.SECTOR_RATING_DURATION,
+    weight_scheme=WeightScheme.LIQUIDITY,          # liquidity-weighted
+    selection_policy=SelectionPolicy.TOP_BY_LIQUIDITY,
+    min_size=12, max_size=30,
+    min_liq_score=0.15,
+    min_amt_out=3e8,
+    group_by_sector=True,
+    group_by_rating=True,
+    group_by_duration_bucket=True,
+    enable_relaxation=True,                        # widen duration → neighbor rating if needed
+    relaxation_steps=("widen_duration", "neighbor_rating")
+)
+
+# 3) Build
+ctor = BasketConstructor(universe)
+basket_results = ctor.build_group_baskets(cfg)
+
+# 4) Consume results
+for res in basket_results:
+    print(res.meta.group_keys, res.constituents[['isin','weight']].head())
+
+B) Generate Similarity-Based Basket from a Reference ISIN
+sim_cfg = BasketConfig(
+    basket_type=BasketType.SIMILARITY,
+    weight_scheme=WeightScheme.AMOUNT_OUTSTANDING,
+    min_size=10, max_size=20,
+    duration_tolerance_years=0.5,       # ±0.5y as required
+    enforce_exact_rating=True,
+    enforce_same_sector=True,
+    strictly_higher_liquidity_than_ref=True,
+    enable_relaxation=True,             # will only widen duration tolerance for similarity
+    relaxation_steps=("widen_duration",)
+)
+
+ctor = BasketConstructor(universe)
+similar = ctor.build_similarity_basket(reference_isin="XS1122334455", config=sim_cfg)
+
+print(similar.meta)
+print(similar.constituents[['isin','sector','rating','duration_years','liq_score','weight']])
+
+C) Switch Weighting Methods
+# Equal weight sector-only baskets (broad screens)
+eq_cfg = BasketConfig(
+    basket_type=BasketType.SECTOR,
+    weight_scheme=WeightScheme.EQUAL,
+    min_size=5, max_size=25,
+    group_by_sector=True
+)
+
+# Amount outstanding weighted baskets by sector+rating
+ao_cfg = BasketConfig(
+    basket_type=BasketType.SECTOR_RATING,
+    weight_scheme=WeightScheme.AMOUNT_OUTSTANDING,
+    min_size=10, max_size=40,
+    group_by_sector=True, group_by_rating=True,
+    min_amt_out=5e8
+)
+
+# Liquidity weighted (recommended for execution realism)
+liq_cfg = BasketConfig(
+    basket_type=BasketType.SECTOR_RATING_DURATION,
+    weight_scheme=WeightScheme.LIQUIDITY,
+    min_size=15, max_size=50,
+    group_by_sector=True, group_by_rating=True, group_by_duration_bucket=True,
+    min_liq_score=0.1
+)
+
+Key Implementation Details (Practical)
+Weighting Strategies (sketch)
+class EqualWeight(WeightingStrategy):
+    def compute(self, df_sel: pd.DataFrame) -> pd.Series:
+        n = len(df_sel)
+        if n == 0:
+            return pd.Series(dtype=float)
+        w = np.full(n, 1.0 / n, dtype=float)
+        return pd.Series(w, index=df_sel["isin"].values, name="weight")
+
+class OutstandingWeight(WeightingStrategy):
+    def compute(self, df_sel: pd.DataFrame) -> pd.Series:
+        x = df_sel["amt_out"].astype(float).clip(lower=0.0)
+        s = x.sum()
+        if s <= 0:
+            # fallback to equal weight to preserve long-only + normalization
+            return EqualWeight().compute(df_sel)
+        return (x / s).rename("weight").set_axis(df_sel["isin"].values)
+
+class LiquidityWeight(WeightingStrategy):
+    def compute(self, df_sel: pd.DataFrame) -> pd.Series:
+        x = df_sel["liq_score"].astype(float).clip(lower=0.0)
+        s = x.sum()
+        if s <= 0:
+            return EqualWeight().compute(df_sel)
+        return (x / s).rename("weight").set_axis(df_sel["isin"].values)
+
+Selection Policy (sketch)
+def _apply_selection_policy(self, df: pd.DataFrame, config: BasketConfig) -> pd.DataFrame:
+    if config.selection_policy == SelectionPolicy.TOP_BY_LIQUIDITY:
+        order = ["liq_score", "amt_out", "isin"]
+        asc = [False, False, True]
+    elif config.selection_policy == SelectionPolicy.TOP_BY_AMOUNT_OUT:
+        order = ["amt_out", "liq_score", "isin"]
+        asc = [False, False, True]
+    else:  # RANDOM_WITH_SEED
+        rng = np.random.default_rng(config.random_seed)
+        df = df.assign(_rand=rng.random(len(df)))
+        order = ["_rand", "isin"]
+        asc = [True, True]
+
+    df_sorted = df.sort_values(order, ascending=asc, kind="mergesort")  # stable
+    return df_sorted.head(config.max_size)
+
+Group Basket Construction (sketch)
+def build_group_baskets(self, config: BasketConfig) -> List[BasketResult]:
+    config.validate()
+    df = self.universe.df.copy()
+
+    # Apply global filters
+    if config.min_liq_score is not None:
+        df = df[df["liq_score"] >= float(config.min_liq_score)]
+    if config.min_amt_out is not None:
+        df = df[df["amt_out"] >= float(config.min_amt_out)]
+
+    # Determine grouping columns
+    group_cols = []
+    if config.group_by_sector:
+        group_cols.append("sector")
+    if config.group_by_rating:
+        group_cols.append("rating")
+    if config.group_by_duration_bucket:
+        group_cols.append("duration_bucket")
+    if not group_cols:
+        raise InvalidConfigurationError("No grouping keys set for group basket.")
+
+    results = []
+    for keys, df_g in df.groupby(group_cols, sort=False, dropna=False):
+        # keys is tuple aligned to group_cols; build dict for meta
+        key_map = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
+
+        # Enforce min_size via selection + optional relaxations
+        sel = self._apply_selection_policy(df_g, config)
+        if len(sel) < config.min_size and config.enable_relaxation:
+            sel = self._relax_and_reselect(df_g, config)  # implement widening/neighbor rating
+        if len(sel) < config.min_size:
+            continue  # or raise InsufficientCandidatesError for strict runs
+
+        w = self._compute_weights(sel, config.weight_scheme)
+        out = sel.copy()
+        out = out.loc[w.index].assign(weight=w.values)
+        meta = BasketMeta(
+            basket_type=config.basket_type,
+            group_keys=key_map,
+            weight_scheme=config.weight_scheme,
+            selection_policy=config.selection_policy,
+            build_ts=self.universe.snapshot_ts,
+            constraints={
+                "min_liq_score": config.min_liq_score,
+                "min_amt_out": config.min_amt_out
+            }
+        )
+        results.append(BasketResult(constituents=out.reset_index(drop=True), meta=meta))
+    return results
+
+Similarity Basket (sketch)
+def build_similarity_basket(self, reference_isin: str, config: BasketConfig) -> BasketResult:
+    config.validate()
+    df = self.universe.df
+    if reference_isin not in df["isin"].values:
+        raise MissingReferenceError(f"Reference ISIN {reference_isin} not found.")
+
+    ref = df.loc[df["isin"] == reference_isin].iloc[0]
+    # Base mask
+    mask = pd.Series(True, index=df.index)
+
+    if config.enforce_same_sector:
+        mask &= (df["sector"] == ref["sector"])
+    if config.enforce_exact_rating:
+        mask &= (df["rating"] == ref["rating"])
+
+    dur_tol = config.duration_tolerance_years
+    mask &= (np.abs(df["duration_years"] - float(ref["duration_years"])) <= dur_tol)
+
+    if config.strictly_higher_liquidity_than_ref:
+        mask &= (df["liq_score"] > float(ref["liq_score"]))
+
+    # Remove the reference itself
+    mask &= (df["isin"] != reference_isin)
+
+    cand = df[mask]
+    sel = self._apply_selection_policy(cand, config)
+
+    if len(sel) < config.min_size and config.enable_relaxation:
+        # only widen duration for similarity baskets
+        for extra in (0.25, 0.25):  # e.g., +0.25 then +0.25 (total +0.5)
+            dur_tol += extra
+            mask2 = mask.copy()
+            # rebuild duration constraint
+            mask2 = (np.abs(df["duration_years"] - float(ref["duration_years"])) <= dur_tol)
+            if config.enforce_same_sector:
+                mask2 &= (df["sector"] == ref["sector"])
+            if config.enforce_exact_rating:
+                mask2 &= (df["rating"] == ref["rating"])
+            if config.strictly_higher_liquidity_than_ref:
+                mask2 &= (df["liq_score"] > float(ref["liq_score"]))
+            mask2 &= (df["isin"] != reference_isin)
+            sel = self._apply_selection_policy(df[mask2], config)
+            if len(sel) >= config.min_size:
+                break
+
+    if len(sel) < config.min_size:
+        raise InsufficientCandidatesError("Not enough similar bonds to form the basket.")
+
+    w = self._compute_weights(sel, config.weight_scheme)
+    out = sel.loc[w.index].assign(weight=w.values)
+    meta = BasketMeta(
+        basket_type=config.basket_type,
+        group_keys={"sector": ref["sector"], "rating": ref["rating"]},
+        weight_scheme=config.weight_scheme,
+        selection_policy=config.selection_policy,
+        build_ts=self.universe.snapshot_ts,
+        constraints={
+            "ref_isin": reference_isin,
+            "ref_duration": float(ref["duration_years"]),
+            "duration_tolerance": dur_tol,
+            "strictly_higher_liquidity_than_ref": config.strictly_higher_liquidity_than_ref
+        },
+        reference_isin=reference_isin
+    )
+    return BasketResult(constituents=out.reset_index(drop=True), meta=meta)
+
+Design Principles Mapped to Requirements
+
+Modular & Extensible
+New weighting schemes → implement WeightingStrategy.
+New basket types → extend BasketType + add builder in BasketConstructor.
+
+Separation of Concerns
+Prep vs. selection vs. config are distinct.
+
+Performance
+Vectorized filters, limited sorts, deterministic stable ordering.
+
+Validation & Errors
+Strict config validation; explicit exceptions; optional relaxation.
+
+Traceability
+BasketMeta captures constraints, group keys, and the universe snapshot.
+
+Practical Notes & Conventions
+
+Rating Normalization: maintain both rating string and rating_score ordinal; use rating for equality (business rule) and rating_score only for relaxation (neighbor bands).
+
+Liquidity Constraint for Similarity: strictly higher than reference is enforced before selection to prevent reference-like illiquid picks.
+
+Long-only Guarantee: all strategies return non-negative weights; normalization sums to 1.
+
+Tie-breaking: always documented and deterministic; isin lexicographic as final key.
+
+Unit Tests (recommended)
+
+Prep: missing columns, rating map coverage, bucket labeling.
+
+Constructor: (i) exact-size groups, (ii) insufficient candidates with/without relaxation, (iii) weight sanity (sum=1, non-neg), (iv) similarity constraints.
+
+Determinism: repeated runs produce identical outputs.
+
+Minimal “Getting Started” Checklist
+
+Implement DataPrepBasket with your house RATING_MAP and column aliases.
+
+Implement WeightingStrategy classes (3 included).
+
+Implement BasketConstructor with:
+
+_apply_selection_policy
+
+build_group_baskets
+
+build_similarity_basket
+
+Optional _relax_and_reselect helper.
+
+Implement BasketConfig.validate() and enumerations in basket_types.py.
+
+Add errors.py with the custom exceptions.
+
+Write 6–8 unit tests per area; add a smoke test over a sample universe (1–2k bonds).
+
+Example Output DataFrame (per basket)
+   isin           sector   rating  rating_score  duration_years duration_bucket    amt_out    liq_score   weight
+0  US...  Communications        A            15            3.25          3-5y   1.20e+09        0.73     0.0813
+1  XS...  Communications        A            15            3.40          3-5y   9.50e+08        0.69     0.0781
+...
+
+
+This design is ready to implement in a research codebase and to evolve with additional basket definitions (e.g., currency splits, country overlays) and more nuanced weighting (e.g., blended liquidity × size) without disrupting existing interfaces.
+
+You said:
+i dont need a liquidity calculator-i have liquidity pre computed, i want the universe filter in terms of a TradingSchema in my data_prep_basket- i have a file called basket_types taht defines the core _data strcutures and constants and building and validating the baskets it standarsizes column names, required types and filter types and provides structured output and input data classes to streamline basket construction- refactor your approach using the information as an expert engineer. your response should be in terms of detailed prompts I can use for Cursor
+ChatGPT said:
+Thought for 6s
+
+got it — here are copy-pasteable, Cursor-ready prompts to refactor your system so that:
+
+No liquidity calculator is implemented (we just consume your precomputed liq_score)
+
+Universe filtering lives under a TradingSchema in data_prep_basket
+
+basket_types.py is the canonical place for core data structures, constants, standardization, validation, and structured I/O dataclasses
+
+The design is clean, extensible, and production-grade for RV workflows
+
+Use these prompts in order. Each prompt specifies: goal, files, tasks, constraints, acceptance tests.
+
+0) Workspace Prep (Cursor Prompt)
+
+Prompt:
+
+You are my senior Python engineer. We are refactoring a bond basket builder.
+Stack: Python 3.11, pandas, numpy, scipy, pydantic>=2.
+
+Create a clean repo layout:
+
+/baskets/
+  __init__.py
+  basket_types.py
+  data_prep_basket.py
+  basket_construction.py
+  errors.py
+/tests/
+  test_basket_types.py
+  test_data_prep_basket.py
+  test_basket_construction.py
+pyproject.toml (ruff, black, pytest)
+/README.md
+
+Conventions:
+- Use pydantic v2 BaseModel for schemas (runtime validation, type coercion).
+- No global singletons.
+- Deterministic sorting (stable mergesort).
+- We DO NOT compute liquidity; liq_score is precomputed and only used as a filter/sort key.
+- All weights must be >= 0 and sum to 1 (±1e-10).
+
+Scaffold empty modules with docstrings and TODOs. Add pyproject with ruff/black/pytest config. 
+
+1) Core Types & Schema in basket_types.py (Cursor Prompt)
+
+Prompt:
+
+Open baskets/basket_types.py and implement the **canonical data & config layer**.
+
+GOAL
+- Centralize column standardization, required datatypes, filters, enumerations, and structured I/O types.
+- Provide strict, explicit schemas for input rows, universe, filter specs, and basket requests/results.
+- Provide a single source of truth for canonical column names and dtypes.
+
+CONSTRAINTS
+- We DO NOT compute liquidity. `liq_score` is precomputed (monotone higher=more liquid).
+- Ratings: keep both string label (`rating`) and optional ordinal (`rating_score`) used only for neighbor relaxations.
+- Duration is in years (float >= 0). Buckets are derived elsewhere but bucket labels live here.
+- Use pydantic v2 BaseModel with `model_config = ConfigDict(frozen=True, str_strip_whitespace=True)` for immutability.
+- Use `Literal`/`Enum` for constrained choices.
+- All schemas must be serializable to/from dict cleanly.
+
+TASKS
+1) Implement canonical constants:
+   - CANONICAL_COLS: tuple[str, ...] = ("isin","sector","rating","duration_years","amt_out","liq_score")
+   - DTYPES: dict[str, type] (e.g., str, float)
+   - DURATION_BUCKET_EDGES: tuple[float, ...] = (0,1,3,5,7,10,30)
+   - DURATION_BUCKET_LABELS: tuple[str, ...] = ("0-1y","1-3y","3-5y","5-7y","7-10y","10-30y")
+
+2) Enums:
+   - BasketType: SECTOR, SECTOR_RATING, SECTOR_RATING_DURATION, SIMILARITY
+   - WeightScheme: EQUAL, AMOUNT_OUTSTANDING, LIQUIDITY
+   - SelectionPolicy: TOP_BY_LIQUIDITY, TOP_BY_AMOUNT_OUT, RANDOM_WITH_SEED
+
+3) Filter primitives:
+   - class NumericRange(BaseModel): min: float | None = None; max: float | None = None; method .contains(x)->bool
+   - class FilterSpec(BaseModel):
+       sector_in: set[str] | None = None
+       rating_in: set[str] | None = None
+       duration_years: NumericRange | None = None
+       amt_out: NumericRange | None = None
+       liq_score: NumericRange | None = None
+     Include .to_mask(df)->pd.Series method that builds a boolean mask using canonical columns.
+
+4) Trading schema & standardization:
+   - class TradingSchema(BaseModel):
+       # canonical columns and dtype expectations; used by data_prep_basket
+       canonical_cols: tuple[str, ...] = CANONICAL_COLS
+       dtypes: dict[str, type] = DTYPES
+       duration_bucket_edges: tuple[float, ...] = DURATION_BUCKET_EDGES
+       duration_bucket_labels: tuple[str, ...] = DURATION_BUCKET_LABELS
+       column_aliases: dict[str,str] = {}  # caller can set mapping RAW->CANONICAL
+     Methods:
+       - .apply_aliases(df)->pd.DataFrame
+       - .coerce_types(df)->pd.DataFrame (best-effort astype with errors='ignore')
+       - .validate_required(df) -> None (raise MissingColumns)
+       - .derive_duration_bucket(df)->pd.DataFrame (pd.cut with labels)
+     NOTE: Do not compute any liquidity metric. Only pass `liq_score` through.
+
+5) Structured inputs/outputs:
+   - class BondRow(BaseModel): isin:str, sector:str, rating:str, duration_years:float, amt_out:float, liq_score:float
+   - class UniverseSnapshot(BaseModel):
+       as_of: datetime
+       rating_map: dict[str,int] = {}   # optional ordinal map
+       schema: TradingSchema
+   - class BasketGrouping(BaseModel):
+       group_by_sector: bool = True
+       group_by_rating: bool = False
+       group_by_duration_bucket: bool = False
+       def columns(self)->list[str]
+   - class BasketConstraints(BaseModel):
+       min_size: int = 5
+       max_size: int = 25
+       min_liq_score: float | None = None
+       min_amt_out: float | None = None
+       duration_tolerance_years: float = 0.5  # for similarity flows
+       enforce_exact_rating: bool = True
+       enforce_same_sector: bool = True
+       strictly_higher_liquidity_than_ref: bool = True
+       enable_relaxation: bool = True
+       relaxation_steps: tuple[str, ...] = ("widen_duration","neighbor_rating")
+       random_seed: int | None = None
+       def validate_sizes(self)->None (raise InvalidConfigurationError)
+
+   - class BasketRequest(BaseModel):
+       basket_type: BasketType
+       weight_scheme: WeightScheme
+       selection_policy: SelectionPolicy = SelectionPolicy.TOP_BY_LIQUIDITY
+       grouping: BasketGrouping | None = None           # must be None for SIMILARITY
+       constraints: BasketConstraints = BasketConstraints()
+       filters: FilterSpec | None = None
+       reference_isin: str | None = None                # required for SIMILARITY
+       def validate_semantics(self)->None (e.g., SIMILARITY cannot set grouping)
+
+   - class BasketMeta(BaseModel):
+       basket_type: BasketType
+       group_keys: dict[str,str] = {}
+       weight_scheme: WeightScheme
+       selection_policy: SelectionPolicy
+       build_ts: datetime
+       constraints_applied: dict[str, object] = {}
+       reference_isin: str | None = None
+
+   - class BasketResult(BaseModel):
+       constituents: pd.DataFrame  # columns include isin, weight and pass-through canonical cols
+       meta: BasketMeta
+
+6) Errors: define light exceptions in baskets/errors.py:
+   - class InvalidConfigurationError(ValueError): ...
+   - class InsufficientCandidatesError(RuntimeError): ...
+   - class MissingReferenceError(KeyError): ...
+   - class MissingColumns(KeyError): ...
+
+7) Add docstrings to all public classes/methods and type hints.
+
+ACCEPTANCE TESTS (add to tests/test_basket_types.py):
+- Construct FilterSpec and confirm masks behave on a tiny DataFrame.
+- TradingSchema.apply_aliases maps raw columns; validate_required catches misses.
+- BasketRequest.validate_semantics rejects invalid combos; constraints.validate_sizes rejects min>max.
+
+2) Universe Prep with TradingSchema in data_prep_basket.py (Cursor Prompt)
+
+Prompt:
+
+Open baskets/data_prep_basket.py and implement a prep pipeline that uses **TradingSchema** for universe filtering & normalization.
+
+GOAL
+- Provide a thin, deterministic data preparation layer that:
+  (a) standardizes columns via schema aliases,
+  (b) coerces types,
+  (c) validates required canonical columns,
+  (d) derives duration buckets,
+  (e) optionally normalizes ratings to ordinal score (if a rating_map is provided),
+  (f) applies **FilterSpec** to produce a filtered universe.
+- No derived liquidity metrics. `liq_score` is just passed through & used for filtering/sorting later.
+
+API
+- class DataPrepBasket:
+    def __init__(self, schema: TradingSchema, rating_map: dict[str,int] | None = None) -> None
+    def prepare_universe(
+        self, df_raw: pd.DataFrame, as_of: datetime, filters: FilterSpec | None = None
+    ) -> tuple[pd.DataFrame, UniverseSnapshot]:
+        """
+        Returns:
+            df_uni: canonicalized, filtered DataFrame with:
+                ['isin','sector','rating','rating_score'(optional),'duration_years','duration_bucket','amt_out','liq_score', ... passthrough]
+            snap: UniverseSnapshot(as_of, rating_map, schema)
+        Notes:
+            - de-duplicate on 'isin' keeping the row with highest liq_score, then highest amt_out, then first.
+            - enforce non-negative duration_years, amt_out, liq_score (clip below at 0, then filter again if user provides min thresholds in filters).
+        """
+
+INTERNAL DETAILS
+- Implement _normalize_ratings(series)->(ratings, rating_scores) using rating_map if provided; else rating_score can be None or absent.
+- Implement _dedupe_isin(df)->df using stable rules:
+    sort by ['liquidity desc','amt_out desc','isin asc'] then drop_duplicates('isin', keep='first')
+- Implement _apply_filters(df, filters)->df using FilterSpec.to_mask.
+
+ACCEPTANCE TESTS (tests/test_data_prep_basket.py)
+- With alias mapping { "ISIN":"isin","Liquidity":"liq_score","Outstanding":"amt_out","Duration":"duration_years" } the schema canonicalizes correctly.
+- Filters with liq_score.min and amt_out.min reduce rows as expected.
+- Dedupe keeps the most liquid among duplicates.
+- Duration buckets are labeled with DURATION_BUCKET_LABELS.
+
+3) Basket Building in basket_construction.py (Cursor Prompt)
+
+Prompt:
+
+Open baskets/basket_construction.py and implement the basket construction logic using **basket_types** models; do not compute liquidity.
+
+GOAL
+- Implement selection logic for:
+  (1) Group baskets: SECTOR / SECTOR_RATING / SECTOR_RATING_DURATION
+  (2) Similarity baskets anchored on a reference ISIN
+- Implement weight schemes Equal / AmountOutstanding / Liquidity (long-only, normalized).
+- Enforce deterministic selection and robust error handling.
+
+API
+- class BasketConstructor:
+    def __init__(self, universe_df: pd.DataFrame, snapshot: UniverseSnapshot) -> None
+    def build_group_baskets(self, req: BasketRequest) -> list[BasketResult]
+    def build_similarity_basket(self, req: BasketRequest) -> BasketResult
+
+INTERNALS
+- _apply_global_filters(df, req.filters) -> df  # already applied in prep, but keep for safety if user passes new filters
+- _group_columns(req.grouping) -> list[str]
+- _select_in_group(df_g, req) -> pd.DataFrame  # selection policy & size bounds
+- _compute_weights(df_sel, scheme: WeightScheme) -> pd.Series
+- _relax_and_reselect(df_g, req) -> pd.DataFrame  # implement:
+   - widen_duration: extend bucket/years tolerance progressively; cap at +0.5y additional
+   - neighbor_rating: for GROUP baskets only (not SIMILARITY), allow rating_score ±1 if rating_score exists
+- Deterministic tie-breakers:
+   - For TOP_BY_LIQUIDITY: sort by ['liq_score' desc, 'amt_out' desc, 'isin' asc], mergesort
+   - For TOP_BY_AMOUNT_OUT: sort by ['amt_out' desc, 'liq_score' desc, 'isin' asc]
+   - RANDOM_WITH_SEED: generate rng = np.random.default_rng(seed), add column '_rand', sort ['_rand','isin'], then drop '_rand'
+
+SIMILARITY RULES
+- Given reference ISIN row r:
+  sector == r.sector   (if constraints.enforce_same_sector)
+  rating == r.rating   (if constraints.enforce_exact_rating)
+  abs(duration_years - r.duration_years) <= constraints.duration_tolerance_years
+  liq_score > r.liq_score   (if constraints.strictly_higher_liquidity_than_ref)
+  Exclude the reference itself.
+
+WEIGHTS
+- Equal: 1/N
+- AmountOutstanding: proportional to 'amt_out'
+- Liquidity: proportional to 'liq_score' (already precomputed)
+
+RETURNS
+- Each BasketResult includes constituents DataFrame with at least:
+  ['isin','weight','sector','rating','duration_years','duration_bucket','amt_out','liq_score']
+- BasketMeta captures grouping keys, constraints applied, selection policy, build_ts, and (if SIMILARITY) the reference info.
+
+ERRORS
+- Raise InvalidConfigurationError on semantic mistakes.
+- Raise MissingReferenceError if ref isin not found.
+- Raise InsufficientCandidatesError if after relaxations size < min_size.
+
+ACCEPTANCE TESTS (tests/test_basket_construction.py)
+- Group basket by sector+rating+duration_bucket with min_size=3 returns correct counts.
+- Similarity basket enforces “higher liquidity than reference”.
+- Weight sums are ~1.0, all >=0.
+- Deterministic selection equals snapshot across runs with same seed.
+
+4) Tests: Fast, Deterministic Fixtures (Cursor Prompt)
+
+Prompt:
+
+Create tests with a tiny synthetic universe (10-25 bonds) to validate end-to-end behavior.
+
+In tests/test_basket_types.py:
+- Test FilterSpec.to_mask on sector_in, rating_in, and NumericRange combos.
+
+In tests/test_data_prep_basket.py:
+- Build df_raw with mixed column names and duplicates on ISIN.
+- Validate TradingSchema aliasing, type coercion, missing column errors, bucket derivation.
+
+In tests/test_basket_construction.py:
+- Build a Prepared universe via DataPrepBasket.prepare_universe().
+- Test:
+  1) SECTOR_RATING_DURATION group baskets with min_size=2: every produced group >=2.
+  2) SIMILARITY basket with reference ISIN: all picks have same sector & rating, duration within tolerance, and liq_score strictly greater.
+  3) WeightScheme.EQUAL, .AMOUNT_OUTSTANDING, .LIQUIDITY produce non-negative weights summing to ~1.
+  4) TOP_BY_LIQUIDITY vs TOP_BY_AMOUNT_OUT alters order deterministically.
+- Ensure raising InsufficientCandidatesError when constraints impossible and relaxation disabled.
+
+5) Usage Examples in README (Cursor Prompt)
+
+Prompt:
+
+Open README.md and add concise examples:
+
+- Preparing a universe with TradingSchema + FilterSpec
+- Building sector+rating+duration baskets (liquidity-weighted)
+- Building a similarity basket from a reference ISIN
+- Switching weight schemes
+
+Stress that:
+- No liquidity computation occurs; liq_score is precomputed upstream.
+- Universe filtering is governed by TradingSchema + FilterSpec.
+- basket_types.py is the single source of truth for column names, dtypes, and schema.
+
+6) Code Quality & Lint (Cursor Prompt)
+
+Prompt:
+
+Add ruff and black config in pyproject.toml:
+- ruff select: F,E,I,UP,PL,W
+- line-length=100
+- target-version=py311
+Run ruff --fix and black on the project.
+Ensure mypy-friendly type hints where practical.
+
+Add github-style .editorconfig (utf-8, newline lf, 2-space indent for YAML, 4 for Python).
+
+7) Sanity Run (Cursor Prompt)
+
+Prompt:
+
+Add a quick interactive script (examples/smoke.py) that:
+- Creates a tiny demo df
+- Applies DataPrepBasket + FilterSpec
+- Builds one group basket and one similarity basket
+- Prints the resulting constituents and meta
+
+Keep <50 lines. This is not a test; just a quick smoke script.
+
+Notes & Rationale (for you)
+
+TradingSchema is the sole authority for standardization & filtering. This meets your requirement: universe filter in terms of a TradingSchema in data_prep_basket.
+
+basket_types.py centralizes all core data structures and constants (schemas, enums, filter spec, request/response models), so basket_construction.py is thin and business-logic only.
+
+No liquidity calculator anywhere. We only consume liq_score and optionally filter/sort on it.
+
+pydantic v2 provides runtime validation without hand-rolled checks.
+
+Tests bake in determinism, size constraints, similarity constraints, and weight sanity.
+
+If you want, I can also generate seed unit-test universes with realistic IG/HY sectors/ratings to drop straight into /tests/fixtures.py.
