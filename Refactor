@@ -1,0 +1,230 @@
+Bond Basket Construction Refactor Plan
+
+Objective: Implement a minimal, robust, and clearly structured codebase to construct bond baskets using liquid proxies, on a per-sector basis.
+
+1. Design Principles
+
+Minimal Viable Logic: Start with the simplest logic to construct baskets per sector using liquid instruments.
+
+Clear Separation of Concerns: Split code into logical layers: computation, orchestration, and data modeling.
+
+Stateless & Functional: Prefer functions and lightweight classes. Avoid global state or inheritance unless justified.
+
+Testable Units: Every core function must be easily testable using small synthetic data.
+
+Typed Interfaces: All interfaces must be documented and typed using @dataclass or function annotations.
+
+Fail Safe: Empty or invalid input should return empty outputs with no exceptions unless explicitly requested.
+
+2. Project File Structure
+bond_baskets/
+│
+├── builder.py          # Core logic to build baskets from liquid bonds
+├── pipeline.py         # Sector-level orchestration
+├── models.py           # Dataclasses and shared types
+│
+tests/
+├── test_builder.py     # Unit tests for core builder logic
+├── test_pipeline.py    # Basic integration tests per sector
+
+3. Module Responsibilities
+3.1. models.py
+
+Defines structured output formats and types to reduce reliance on raw dictionaries or tuple unpacking.
+
+from dataclasses import dataclass
+import pandas as pd
+
+@dataclass
+class BasketResult:
+    baskets_df: pd.DataFrame
+    summary_df: pd.DataFrame
+
+
+Guidelines:
+
+All returned results from builders and pipelines should use BasketResult.
+
+Avoid passing raw dictionaries of DataFrames between components.
+
+3.2. builder.py
+
+Implements the core logic of constructing baskets from a single canonical dataframe. No sector orchestration is performed here.
+
+import pandas as pd
+from models import BasketResult
+
+class BasketBuilder:
+    def build_sector(self, features_df: pd.DataFrame) -> BasketResult:
+        """
+        Build a basket for a single sector from a canonical features dataframe.
+
+        Expects the following columns:
+        - isin
+        - is_liquid
+        - bucket_id
+        - amt_outstanding
+        - sector
+        - liquidity_score
+
+        Returns:
+        - BasketResult containing a DataFrame of selected bonds and a summary table.
+        """
+        df = features_df[features_df["is_liquid"]].copy()
+        if df.empty:
+            return BasketResult(pd.DataFrame(), pd.DataFrame())
+
+        df = (
+            df.sort_values(["bucket_id", "liquidity_score"], ascending=[True, False])
+              .groupby("bucket_id").head(5)
+        )
+
+        df["weight"] = df["amt_outstanding"] / df["amt_outstanding"].sum()
+
+        summary = (
+            df.groupby("bucket_id")
+              .agg(n_cons=("isin", "nunique"), w_sum=("weight", "sum"))
+              .reset_index()
+        )
+
+        return BasketResult(baskets_df=df, summary_df=summary)
+
+
+Guidelines:
+
+The build_sector method should never raise an exception on malformed input. Instead, it should return empty results.
+
+3.3. pipeline.py
+
+Provides orchestration logic for processing all sectors from a unified canonical dataset.
+
+from builder import BasketBuilder
+from models import BasketResult
+import pandas as pd
+
+def build_all_baskets(df: pd.DataFrame) -> list[BasketResult]:
+    """
+    Run basket construction sector by sector from canonical features DataFrame.
+    
+    Parameters:
+    - df: pd.DataFrame with a 'sector' column and other expected fields.
+
+    Returns:
+    - List of BasketResult, one per sector.
+    """
+    builder = BasketBuilder()
+    sectors = df["sector"].dropna().unique()
+    return [builder.build_sector(df[df["sector"] == sec]) for sec in sectors]
+
+
+Guidelines:
+
+This file should contain only orchestration logic — no transformation or weight calculations.
+
+If the use case expands to support parallel sector processing, this is the place to manage it.
+
+4. Testing Plan
+4.1. tests/test_builder.py
+
+Basic unit tests to validate core builder logic.
+
+import pandas as pd
+from builder import BasketBuilder
+
+def test_build_sector_simple_case():
+    df = pd.DataFrame({
+        "isin": ["A", "B", "C", "D"],
+        "is_liquid": [True, True, False, False],
+        "amt_outstanding": [100, 200, 50, 50],
+        "bucket_id": ["X", "X", "X", "X"],
+        "sector": ["corp"] * 4,
+        "liquidity_score": [0.9, 0.8, 0.1, 0.2]
+    })
+
+    result = BasketBuilder().build_sector(df)
+    assert not result.baskets_df.empty
+    assert result.summary_df["n_cons"].iloc[0] == 2
+
+4.2. tests/test_pipeline.py
+
+Minimal integration check.
+
+from pipeline import build_all_baskets
+import pandas as pd
+
+def test_pipeline_single_sector():
+    df = pd.DataFrame({
+        "isin": ["A", "B"],
+        "is_liquid": [True, True],
+        "amt_outstanding": [100, 200],
+        "bucket_id": ["X", "X"],
+        "sector": ["govt", "govt"],
+        "liquidity_score": [0.95, 0.85]
+    })
+
+    results = build_all_baskets(df)
+    assert len(results) == 1
+    assert results[0].baskets_df.shape[0] == 2
+
+5. Execution Checklist
+5.1. Refactor
+
+ Create models.py and define BasketResult
+
+ Create builder.py with BasketBuilder class and build_sector method
+
+ Create pipeline.py with build_all_baskets
+
+ Copy or port clean utility functions (if any) into these modules
+
+ Delete or archive legacy orchestration and diagnostics code for now
+
+5.2. Test
+
+ Write at least 2 tests for BasketBuilder
+
+ Write 1 test for build_all_baskets
+
+ Run test suite using pytest and confirm passing
+
+6. Future Extensions (Deferred)
+
+These are intentionally excluded for this MVP:
+
+Illiquid-to-liquid mapping
+
+Sector diagnostics, validation thresholds
+
+Error capture and reporting
+
+Config-driven top-N selection or weight method
+
+Factor-based weights or score blending
+
+Output standardization across multiple asset classes
+
+7. Git Commit Strategy
+
+Suggested commit breakdown:
+
+git add bond_baskets/models.py
+git commit -m "Add BasketResult dataclass for output structure"
+
+git add bond_baskets/builder.py
+git commit -m "Implement BasketBuilder for liquid-only sector baskets"
+
+git add bond_baskets/pipeline.py
+git commit -m "Add sector-level orchestration to run basket builder across sectors"
+
+git add tests/test_builder.py tests/test_pipeline.py
+git commit -m "Add basic unit and integration tests for MVP basket construction"
+
+8. Naming Conventions
+Concept	Naming
+Output container	BasketResult
+Main class	BasketBuilder
+Orchestration	build_all_baskets
+Unit test	test_build_sector_*
+Sector column	"sector"
+Liquidity filter column	"is_liquid"
+Bucket column	"bucket_id"
